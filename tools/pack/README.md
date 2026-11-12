@@ -96,6 +96,7 @@ Local lifecycle commands:
 
 - `tools-pack linux build --to all` (default; produces AppImage)
 - `tools-pack linux build --to appimage` (explicit AppImage)
+- `tools-pack linux build --to deb` (explicit Debian package; see "Debian package" below)
 - `tools-pack linux build --to dir` (unpacked output for fast iteration)
 - `tools-pack linux build --containerized` (run electron-builder inside `electronuserland/builder:base` Docker for a wider glibc compatibility target — requires Docker)
 - `tools-pack linux build --to all --portable` (release artifacts that must not bake local tools-pack runtime paths)
@@ -170,13 +171,28 @@ Verified smoke coverage in this repository currently includes:
 
 ### Format choice: why AppImage first
 
-Linux desktop apps in this space split across formats: VS Code ships `.deb` + `.rpm` + Snap; Discord ships AppImage + `.deb`; Slack ships `.deb` + `.rpm`; Cursor and Obsidian ship AppImage. We start with AppImage because one artifact can cover the widest glibc-compatible target without distro repositories, store packaging, signing infrastructure, or per-format install scripts, and it integrates cleanly with the namespace-scoped install layout. `.deb` / `.rpm` / Snap / Flatpak can land incrementally when user demand justifies the extra release ownership.
+Linux desktop apps in this space split across formats: VS Code ships `.deb` + `.rpm` + Snap; Discord ships AppImage + `.deb`; Slack ships `.deb` + `.rpm`; Cursor and Obsidian ship AppImage. We start with AppImage because one artifact can cover the widest glibc-compatible target without distro repositories, store packaging, signing infrastructure, or per-format install scripts, and it integrates cleanly with the namespace-scoped install layout. `.rpm` / Snap / Flatpak can land incrementally when user demand justifies the extra release ownership.
+
+### Debian package (`--to deb`)
+
+`tools-pack linux build --to deb` produces a `.deb` for Debian/Ubuntu-family hosts. It is an explicit opt-in target: `all` still means AppImage, because publishing a second format is a release decision rather than a build default.
+
+- `tools-pack linux build --to deb --portable` for a distributable artifact.
+- `tools-pack linux build --to deb --containerized` to build in `electronuserland/builder:base` for a wider glibc baseline.
+
+The artifact lands next to the AppImage path, in `.tmp/tools-pack/out/linux/namespaces/<namespace>/builder/open-design-<namespace>.deb`, and the build result reports it as `debPath` (`appImagePath` is `null` for this target).
+
+A `.deb` is a system install, not a per-namespace developer artifact, so its lifecycle deliberately differs from AppImage:
+
+- Install with `sudo apt install ./open-design-<namespace>.deb` (or `sudo dpkg -i`). electron-builder's own maintainer scripts place the app under `/opt/Open Design`, link `/usr/bin/Open Design`, install the icon and desktop entry, and fix up `chrome-sandbox` / AppArmor.
+- `linux install`, `linux start`, and `linux stop` refuse a `--to deb` config: they manage an AppImage copied into `~/.local/bin` and relaunched with `--appimage-extract-and-run`, which does not apply to a system package. `linux logs`, `linux inspect`, `linux uninstall`, and `linux cleanup` still work, because they only read namespace-scoped state.
+- The namespace cannot ride on the desktop entry the way it does for AppImage. electron-builder derives `Exec=/opt/<product>/<executable>` itself and rejects a custom `Exec`, so the namespace is carried by the baked `open-design-config.json` as well as the package name and the `Name=` display suffix. Two namespaces therefore install as two distinct packages instead of colliding in `/opt`.
 
 ### Out of scope (later phases)
 
 - AppImage signing (`--signed`) — deferred pending a GPG key infrastructure decision and a user-facing verification flow design (no ETA).
 - AppImage auto-update feed (`latest-linux.yml`) — the linux electron-builder config has no `publish` block wired, so a generated feed would point users at a feed that never updates. Tracked alongside signing.
-- Additional package formats: `.deb`, `.rpm`, Snap, Flatpak — deferred until there is demand and an owner for per-distro metadata, signing/store/repository plumbing, install/remove hooks, and release validation.
+- Additional package formats: `.rpm`, Snap, Flatpak — deferred until there is demand and an owner for per-distro metadata, signing/store/repository plumbing, install/remove hooks, and release validation. The `.deb` lane ships only as a local/explicit build target; no release workflow or public download asset is wired for it yet.
 - Full Linux AppImage and headless packaged smoke remain outside the main PR gate; run the applicable tools-pack validation manually or through a release lane when Linux packaging changes.
 
 `--to dmg` is manual-install DMG output only. Any builder-generated updater metadata such as `latest-mac.yml` or

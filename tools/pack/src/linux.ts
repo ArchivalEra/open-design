@@ -104,6 +104,19 @@ async function commandExists(bin: string): Promise<boolean> {
   }
 }
 
+// `install`/`start` are AppImage-lifecycle commands: they copy an AppImage into
+// ~/.local/bin and relaunch it with --appimage-extract-and-run. A `.deb` installs
+// itself through dpkg into /opt with its own desktop entry, so there is nothing
+// for those commands to manage. Fail loudly instead of copying a .deb to a path
+// the launcher would then try to exec as an AppImage.
+export function assertLinuxInstallableArtifact(config: ToolPackConfig, action: "install" | "start"): void {
+  if (config.to !== "deb") return;
+  throw new Error(
+    `linux ${action} does not support --to deb; the .deb installs itself via dpkg (sudo apt install ./<artifact>.deb). ` +
+      "Use `tools-pack linux build --to deb` to produce it.",
+  );
+}
+
 type DockerUserMapping = {
   uid: number;
   gid: number;
@@ -139,7 +152,7 @@ export function buildDockerArgs(
   //   - config.namespace is sanitized at config-time by resolveNamespace() in
   //     @open-design/sidecar-proto (restricted to namespace charset)
   //   - config.to is enum-validated by resolveToolPackBuildOutput() in config.ts
-  //     to one of "all" | "appimage" | "dir"
+  //     to one of "all" | "appimage" | "deb" | "dir"
   //   - config.portable is a boolean
   //   - config.appVersion is shell-quoted below because release versions can
   //     carry punctuation that is not part of the namespace / target enums.
@@ -584,8 +597,18 @@ async function writeLinuxAppImageAppRun(paths: LinuxPaths): Promise<void> {
 
 // --- Step 5: writeLinuxBuilderConfig helper ---
 
+// electron-builder target names, per tools-pack `--to` value. `all` keeps the
+// AppImage default the Linux lane has always shipped; `deb` is an explicit
+// opt-in so nobody starts publishing a new format by accident.
+export function resolveLinuxBuilderTargets(to: ToolPackConfig["to"]): string[] {
+  if (to === "dir") return ["dir"];
+  if (to === "deb") return ["deb"];
+  return ["AppImage"];
+}
+
 async function writeLinuxBuilderConfig(config: ToolPackConfig, paths: LinuxPaths): Promise<void> {
-  const target = config.to === "dir" ? ["dir"] : ["AppImage"];
+  const target = resolveLinuxBuilderTargets(config.to);
+  const isAppImage = config.to !== "dir" && config.to !== "deb";
   const namespaceToken = sanitizeNamespace(config.namespace);
   const packagedVersion = await readPackagedVersion(config);
   const packageVersion = electronBuilderVersionForAppVersion(packagedVersion);
@@ -620,16 +643,16 @@ async function writeLinuxBuilderConfig(config: ToolPackConfig, paths: LinuxPaths
       // process.resourcesPath by the desktop main at runtime).
       domToPptxBundleResource(config),
     ],
-    ...(config.to === "dir"
-      ? {}
-      : {
+    ...(isAppImage
+      ? {
           extraFiles: [
             {
               from: paths.appImageAppRunPath,
               to: "AppRun",
             },
           ],
-        }),
+        }
+      : {}),
     files: ["**/*", "!**/node_modules/.bin", "!**/node_modules/electron{,/**/*}"],
     icon: linuxResources.icon,
     linux: {
@@ -642,9 +665,40 @@ async function writeLinuxBuilderConfig(config: ToolPackConfig, paths: LinuxPaths
     // Keep the AppImage launch fallback explicit. Our top-level AppRun wrapper
     // clears ELECTRON_RUN_AS_NODE before these Chromium flags reach Electron,
     // including for AppImageLauncher-generated desktop entries.
-    appImage: {
-      executableArgs: [...LINUX_APPIMAGE_EXECUTABLE_ARGS],
-    },
+    ...(isAppImage
+      ? {
+          appImage: {
+            executableArgs: [...LINUX_APPIMAGE_EXECUTABLE_ARGS],
+          },
+        }
+      : {}),
+    ...(config.to === "deb"
+      ? {
+          // A `.deb` is a system install into /opt, not a per-namespace
+          // developer artifact. electron-builder derives Exec=/opt/<product>
+          // itself and refuses a custom Exec, so the namespace cannot ride on
+          // the desktop entry the way it does for AppImage; it travels in the
+          // baked open-design-config.json instead. Debian package names must be
+          // lowercase, so the namespace token is lowercased here. A deb-scoped
+          // executableName gives the command-line entry a clean
+          // `open-design-<namespace>` name instead of "Open Design" with a
+          // space under /usr/bin; AppImage keeps the shared PRODUCT_NAME.
+          artifactName: `open-design-${namespaceToken.toLowerCase()}.\${ext}`,
+          executableName: `open-design-${namespaceToken.toLowerCase()}`,
+          deb: {
+            packageName: `open-design-${namespaceToken.toLowerCase()}`,
+            priority: "optional",
+            packageCategory: "devel",
+            desktop: {
+              entry: {
+                Name: `${PRODUCT_NAME} (${namespaceToken})`,
+                Comment: `Open Design packaged build (${namespaceToken})`,
+                MimeType: "x-scheme-handler/od;",
+              },
+            },
+          },
+        }
+      : {}),
     nodeGypRebuild: false,
     npmRebuild: false,
     productName: PRODUCT_NAME,
@@ -685,10 +739,27 @@ async function findBuiltAppImage(paths: LinuxPaths): Promise<string | null> {
   return appImage ? join(paths.appBuilderOutputRoot, appImage) : null;
 }
 
+async function findBuiltDeb(paths: LinuxPaths): Promise<string | null> {
+  if (!(await pathExists(paths.appBuilderOutputRoot))) return null;
+  const entries = await readdir(paths.appBuilderOutputRoot);
+  const deb = entries.find((entry) => entry.endsWith(".deb"));
+  return deb ? join(paths.appBuilderOutputRoot, deb) : null;
+}
+
+async function readBuiltArtifactPaths(
+  config: ToolPackConfig,
+  paths: LinuxPaths,
+): Promise<{ appImagePath: string | null; debPath: string | null }> {
+  if (config.to === "dir") return { appImagePath: null, debPath: null };
+  if (config.to === "deb") return { appImagePath: null, debPath: await findBuiltDeb(paths) };
+  return { appImagePath: await findBuiltAppImage(paths), debPath: null };
+}
+
 // --- Step 7: packLinux orchestrator + result type + stub for runBuildInContainer ---
 
 export type LinuxPackResult = {
   appImagePath: string | null;
+  debPath: string | null;
   outputRoot: string;
   resourceRoot: string;
   runtimeNamespaceRoot: string;
@@ -700,9 +771,10 @@ export async function packLinux(config: ToolPackConfig): Promise<LinuxPackResult
   if (config.containerized) {
     await runBuildInContainer(config);
     const paths = resolveLinuxPaths(config);
-    const appImagePath = config.to === "dir" ? null : await findBuiltAppImage(paths);
+    const { appImagePath, debPath } = await readBuiltArtifactPaths(config, paths);
     return {
       appImagePath,
+      debPath,
       outputRoot: paths.appBuilderOutputRoot,
       resourceRoot: paths.resourceRoot,
       runtimeNamespaceRoot: config.roots.runtime.namespaceRoot,
@@ -720,15 +792,16 @@ export async function packLinux(config: ToolPackConfig): Promise<LinuxPackResult
   await copyResourceTree(config, paths);
   const tarballs = await collectWorkspaceTarballs(config, paths);
   await writeAssembledApp(config, paths, tarballs);
-  if (config.to !== "dir") {
+  if (resolveLinuxBuilderTargets(config.to).includes("AppImage")) {
     await writeLinuxAppImageAppRun(paths);
   }
   await writeLinuxBuilderConfig(config, paths);
   await runElectronBuilderLinux(config, paths);
 
-  const appImagePath = config.to === "dir" ? null : await findBuiltAppImage(paths);
+  const { appImagePath, debPath } = await readBuiltArtifactPaths(config, paths);
   return {
     appImagePath,
+    debPath,
     outputRoot: paths.appBuilderOutputRoot,
     resourceRoot: paths.resourceRoot,
     runtimeNamespaceRoot: config.roots.runtime.namespaceRoot,
@@ -801,6 +874,7 @@ async function bestEffortRun(bin: string, args: string[]): Promise<"ok" | "missi
 }
 
 export async function installPackedLinuxApp(config: ToolPackConfig): Promise<LinuxInstallResult> {
+  assertLinuxInstallableArtifact(config, "install");
   const paths = resolveLinuxPaths(config);
   const builtAppImage = await findBuiltAppImage(paths);
   if (builtAppImage == null) {
@@ -936,6 +1010,7 @@ async function waitForLinuxStatus<T>(stamps: readonly SidecarStamp[], timeoutMs:
 }
 
 export async function startPackedLinuxApp(config: ToolPackConfig): Promise<LinuxStartResult> {
+  assertLinuxInstallableArtifact(config, "start");
   const paths = resolveLinuxPaths(config);
   const installed = await pathExists(paths.installAppImagePath);
   const built = !installed ? await findBuiltAppImage(paths) : null;
